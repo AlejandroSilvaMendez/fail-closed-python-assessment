@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,10 +56,22 @@ class Workflow:
     def __init__(self, client: SyntheticClient, audit_path: Path, secret: bytes = b"assessment-secret") -> None:
         self.client = client
         self.audit_path = audit_path
+        self.state_path = audit_path.with_suffix(".sqlite3")
         self.secret = secret
-        self._used_approvals: set[str] = set()
-        self._completed: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._init_state()
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.state_path, timeout=30, isolation_level=None)
+
+    def _init_state(self) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS used_approvals (nonce TEXT PRIMARY KEY)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS completions ("
+                "idempotency_key TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, record_json TEXT NOT NULL)"
+            )
 
     def issue_approval(self, payload: Mapping[str, Any], nonce: str = "n-1") -> Approval:
         digest = payload_hash(payload)
@@ -89,18 +102,29 @@ class Workflow:
             self._audit("blocked", idempotency_key, digest, reason="approval_mismatch")
             return {"status": "blocked", "reason": "approval_mismatch", "payload_hash": digest}
 
-        with self._lock:
-            if approval.nonce in self._used_approvals:
+        # BEGIN IMMEDIATE serializes reservations across threads and processes
+        # sharing this state file, so only the reservation holder can call create.
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM used_approvals WHERE nonce = ?", (approval.nonce,)).fetchone():
+                conn.rollback()
                 self._audit("blocked", idempotency_key, digest, reason="approval_reused")
                 return {"status": "blocked", "reason": "approval_reused", "payload_hash": digest}
-            self._used_approvals.add(approval.nonce)
-            if idempotency_key in self._completed:
-                result = {"status": "duplicate", **self._completed[idempotency_key]}
+            conn.execute("INSERT INTO used_approvals(nonce) VALUES (?)", (approval.nonce,))
+            row = conn.execute(
+                "SELECT payload_hash, record_json FROM completions WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone()
+            if row:
+                conn.commit()
+                result = {"status": "duplicate", "payload_hash": row[0], "record": json.loads(row[1])}
                 self._audit("duplicate", idempotency_key, digest)
                 return result
             record = self.client.create(idempotency_key, payload)
+            conn.execute(
+                "INSERT INTO completions(idempotency_key, payload_hash, record_json) VALUES (?, ?, ?)",
+                (idempotency_key, digest, json.dumps(record, sort_keys=True)),
+            )
+            conn.commit()
             result = {"status": "written", "payload_hash": digest, "record": record}
-            self._completed[idempotency_key] = {"payload_hash": digest, "record": record}
             self._audit("written", idempotency_key, digest, record_id=record["id"])
             return result
-

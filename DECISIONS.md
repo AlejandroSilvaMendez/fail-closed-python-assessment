@@ -3,10 +3,10 @@
 The default is a dry run, and the result exposes the canonical SHA-256 payload
 hash so a reviewer can inspect exactly what would be written. Live execution
 requires an HMAC-backed approval artifact whose hash and nonce match the
-payload; the nonce is consumed before the synthetic write. A process-local lock
-protects the idempotency check and write in this assessment. Production code
-would replace that lock and in-memory state with a transactional durable store
-or an atomic uniqueness constraint.
+payload; the nonce is consumed before the synthetic write. A SQLite state file
+and `BEGIN IMMEDIATE` transaction serialize reservations across threads and
+processes sharing the file. Production code could move the same schema and
+uniqueness constraints to the service's database.
 
 The audit file is append-only JSONL and records event type, idempotency key,
 payload hash, and record id only. It intentionally omits raw payloads and
