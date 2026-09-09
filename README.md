@@ -9,3 +9,5 @@ python -m unittest -v
 ```
 
 No external services, credentials, or real records are used.
+
+Proposal answers are in PROPOSAL.md.
